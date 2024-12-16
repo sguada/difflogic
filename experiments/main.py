@@ -4,8 +4,191 @@ import random
 import os
 
 import numpy as np
-import torch
-import torchvision
+import jax
+import jax.numpy as jnp
+from flax import linen as nn
+import optax
+from tqdm import tqdm
+
+from results_json import ResultsJSON
+
+from difflogic import LogicLayer, GroupSum
+
+
+def load_dataset(args):
+    # Placeholder for data loading - replace with actual data loading later
+    if args.dataset == "mnist":
+        num_classes = 10
+        key = jax.random.PRNGKey(0)
+        train_data = jax.random.normal(key, (50000, 784))
+        train_labels = jax.random.randint(key, (50000,), 0, num_classes)
+        test_data = jax.random.normal(key, (10000, 784))
+        test_labels = jax.random.randint(key, (10000,), 0, num_classes)
+
+        return (train_data, train_labels), (test_data, test_labels), None
+    else:
+        raise NotImplementedError(f"Dataset {args.dataset} not yet supported for JAX.")
+
+
+
+def input_dim_of_dataset(dataset):
+    return {
+        'mnist': 784,
+    }[dataset]
+
+
+def num_classes_of_dataset(dataset):
+    return {
+        'mnist': 10,
+    }[dataset]
+
+
+
+
+class Model(nn.Module):
+    in_dim: int
+    out_dim: int
+    num_layers: int
+    num_classes: int
+    tau: float
+    grad_factor: float
+    connections: str
+
+    @nn.compact
+    def __call__(self, x, training: bool):
+        llkw = dict(grad_factor=self.grad_factor, connections=self.connections, implementation="python")
+
+        x = x.reshape((x.shape[0], -1)) # Flatten the input
+
+        for _ in range(self.num_layers):
+            x = LogicLayer(in_dim=self.in_dim if _ == 0 else self.out_dim, out_dim=self.out_dim, **llkw)(x, training=training)
+        x = GroupSum(k=self.num_classes, tau=self.tau)(x)
+        return x
+
+
+def get_model(args):
+    key = jax.random.PRNGKey(0)
+
+    in_dim = input_dim_of_dataset(args.dataset)
+    class_count = num_classes_of_dataset(args.dataset)
+
+    model = Model(in_dim=in_dim, out_dim=args.num_neurons, num_layers=args.num_layers, num_classes=class_count, tau=args.tau, grad_factor=args.grad_factor, connections=args.connections)
+
+    params = model.init(key, jnp.ones((1, in_dim)), training=True)
+
+    # Placeholder loss function
+    def loss_fn(params, x, y):
+        logits = model.apply(params, x, training=True)
+        return optax.softmax_cross_entropy_with_integer_labels(logits, y).mean()
+
+    optimizer = optax.adam(learning_rate=args.learning_rate)
+
+    return model, params, loss_fn, optimizer
+
+
+@jax.jit
+def train_step(params, opt_state, x, y, loss_fn):
+    loss, grads = jax.value_and_grad(loss_fn)(params, x, y)
+    updates, opt_state = optimizer.update(grads, opt_state, params)
+    params = optax.apply_updates(params, updates)
+    return params, opt_state, loss
+
+def eval(params, model, x, y):
+    logits = model.apply(params, x, training=False)
+    accuracy = jnp.mean(jnp.argmax(logits, axis=-1) == y)
+    return accuracy
+
+
+def packbits_eval(model, loader):
+    raise NotImplementedError("PackBitsTensor is not yet supported in JAX.")
+
+
+if __name__ == '__main__':
+
+    ####################################################################################################################
+
+    parser = argparse.ArgumentParser(description='Train logic gate network on the various datasets.')
+
+    parser.add_argument('-eid', '--experiment_id', type=int, default=None)
+
+    parser.add_argument('--dataset', type=str, choices=[
+        'mnist',
+    ], required=True, help='the dataset to use')
+    parser.add_argument('--tau', '-t', type=float, default=10, help='the softmax temperature tau')
+    parser.add_argument('--seed', '-s', type=int, default=0, help='seed (default: 0)')
+    parser.add_argument('--batch-size', '-bs', type=int, default=128, help='batch size (default: 128)')
+    parser.add_argument('--learning-rate', '-lr', type=float, default=0.01, help='learning rate (default: 0.01)')
+
+
+    parser.add_argument('--implementation', type=str, default='python', choices=['cuda', 'python'],
+                        help='`cuda` is the fast CUDA implementation and `python` is simpler but much slower '
+                        'implementation intended for helping with the understanding.')
+
+
+    parser.add_argument('--num-iterations', '-ni', type=int, default=1000, help='Number of iterations (default: 1000)')
+    parser.add_argument('--eval-freq', '-ef', type=int, default=200, help='Evaluation frequency (default: 200)')
+
+
+
+    parser.add_argument('--connections', type=str, default='unique', choices=['random', 'unique'])
+    parser.add_argument('--architecture', '-a', type=str, default='randomly_connected')
+    parser.add_argument('--num_neurons', '-k', type=int)
+    parser.add_argument('--num_layers', '-l', type=int)
+
+    parser.add_argument('--grad-factor', type=float, default=1.)
+
+    args = parser.parse_args()
+
+    ####################################################################################################################
+
+    print(vars(args))
+
+    assert args.num_iterations % args.eval_freq == 0, (
+        f'iteration count ({args.num_iterations}) has to be divisible by evaluation frequency ({args.eval_freq})'
+    )
+
+
+    key = jax.random.PRNGKey(args.seed)
+    (train_data, train_labels), (test_data, test_labels), _ = load_dataset(args)
+    model, params, loss_fn, optimizer = get_model(args)
+
+    opt_state = optimizer.init(params)
+
+
+    best_acc = 0
+
+    for i in tqdm(range(args.num_iterations), desc='iteration', total=args.num_iterations):
+        x = train_data[i % len(train_data)].reshape((1, -1))
+        y = train_labels[i % len(train_data)].reshape((1,))
+
+        params, opt_state, loss = train_step(params, opt_state, x, y, loss_fn)
+
+
+        if (i+1) % args.eval_freq == 0:
+
+            train_accuracy = eval(params, model, train_data, train_labels)
+            test_accuracy = eval(params, model, test_data, test_labels)
+
+            r = {
+                'train_acc': train_accuracy,
+                'test_acc': test_accuracy,
+            }
+
+            print(r)
+
+            if test_accuracy > best_acc:
+                best_acc = test_accuracy
+                print('IS THE BEST UNTIL NOW.')
+
+import math
+import random
+import os
+
+import numpy as np
+import jax
+import jax.numpy as jnp
+from flax import linen as nn
+import optax
 from tqdm import tqdm
 
 from results_json import ResultsJSON
@@ -14,68 +197,23 @@ import mnist_dataset
 import uci_datasets
 from difflogic import LogicLayer, GroupSum, PackBitsTensor, CompiledLogicNet
 
-torch.set_num_threads(1)
-
-BITS_TO_TORCH_FLOATING_POINT_TYPE = {
-    16: torch.float16,
-    32: torch.float32,
-    64: torch.float64
-}
-
 
 def load_dataset(args):
-    validation_loader = None
-    if args.dataset == 'adult':
-        train_set = uci_datasets.AdultDataset('./data-uci', split='train', download=True, with_val=False)
-        test_set = uci_datasets.AdultDataset('./data-uci', split='test', with_val=False)
-        train_loader = torch.utils.data.DataLoader(train_set, batch_size=args.batch_size, shuffle=True)
-        test_loader = torch.utils.data.DataLoader(test_set, batch_size=int(1e6), shuffle=False)
-    elif args.dataset == 'breast_cancer':
-        train_set = uci_datasets.BreastCancerDataset('./data-uci', split='train', download=True, with_val=False)
-        test_set = uci_datasets.BreastCancerDataset('./data-uci', split='test', with_val=False)
-        train_loader = torch.utils.data.DataLoader(train_set, batch_size=args.batch_size, shuffle=True)
-        test_loader = torch.utils.data.DataLoader(test_set, batch_size=int(1e6), shuffle=False)
-    elif args.dataset.startswith('monk'):
-        style = int(args.dataset[4])
-        train_set = uci_datasets.MONKsDataset('./data-uci', style, split='train', download=True, with_val=False)
-        test_set = uci_datasets.MONKsDataset('./data-uci', style, split='test', with_val=False)
-        train_loader = torch.utils.data.DataLoader(train_set, batch_size=args.batch_size, shuffle=True)
-        test_loader = torch.utils.data.DataLoader(test_set, batch_size=int(1e6), shuffle=False)
-    elif args.dataset in ['mnist', 'mnist20x20']:
-        train_set = mnist_dataset.MNIST('./data-mnist', train=True, download=True, remove_border=args.dataset == 'mnist20x20')
-        test_set = mnist_dataset.MNIST('./data-mnist', train=False, remove_border=args.dataset == 'mnist20x20')
+    # Placeholder for data loading - replace with actual data loading later
+    if args.dataset == "mnist":
+        num_classes = 10
+        key = jax.random.PRNGKey(0)
+        train_data = jax.random.normal(key, (50000, 784))
+        train_labels = jax.random.randint(key, (50000,), 0, num_classes)
+        test_data = jax.random.normal(key, (10000, 784))
+        test_labels = jax.random.randint(key, (10000,), 0, num_classes)
 
-        train_set_size = math.ceil((1 - args.valid_set_size) * len(train_set))
-        valid_set_size = len(train_set) - train_set_size
-        train_set, validation_set = torch.utils.data.random_split(train_set, [train_set_size, valid_set_size])
-
-        train_loader = torch.utils.data.DataLoader(train_set, batch_size=args.batch_size, shuffle=True, pin_memory=True, drop_last=True, num_workers=4)
-        validation_loader = torch.utils.data.DataLoader(validation_set, batch_size=args.batch_size, shuffle=False, pin_memory=True, drop_last=True)
-        test_loader = torch.utils.data.DataLoader(test_set, batch_size=args.batch_size, shuffle=False, pin_memory=True, drop_last=True)
-    elif 'cifar-10' in args.dataset:
-        transform = {
-            'cifar-10-3-thresholds': lambda x: torch.cat([(x > (i + 1) / 4).float() for i in range(3)], dim=0),
-            'cifar-10-31-thresholds': lambda x: torch.cat([(x > (i + 1) / 32).float() for i in range(31)], dim=0),
-        }[args.dataset]
-        transforms = torchvision.transforms.Compose([
-            torchvision.transforms.ToTensor(),
-            torchvision.transforms.Lambda(transform),
-        ])
-        train_set = torchvision.datasets.CIFAR10('./data-cifar', train=True, download=True, transform=transforms)
-        test_set = torchvision.datasets.CIFAR10('./data-cifar', train=False, transform=transforms)
-
-        train_set_size = math.ceil((1 - args.valid_set_size) * len(train_set))
-        valid_set_size = len(train_set) - train_set_size
-        train_set, validation_set = torch.utils.data.random_split(train_set, [train_set_size, valid_set_size])
-
-        train_loader = torch.utils.data.DataLoader(train_set, batch_size=args.batch_size, shuffle=True, pin_memory=True, drop_last=True, num_workers=4)
-        validation_loader = torch.utils.data.DataLoader(validation_set, batch_size=args.batch_size, shuffle=False, pin_memory=True, drop_last=True)
-        test_loader = torch.utils.data.DataLoader(test_set, batch_size=args.batch_size, shuffle=False, pin_memory=True, drop_last=True)
-
+        return (train_data, train_labels), (test_data, test_labels), None
     else:
-        raise NotImplementedError(f'The data set {args.dataset} is not supported!')
+        raise NotImplementedError(f"Dataset {args.dataset} not yet supported for JAX.")
 
-    return train_loader, validation_loader, test_loader
+
+
 
 
 def load_n(loader, n):
@@ -116,59 +254,52 @@ def num_classes_of_dataset(dataset):
     }[dataset]
 
 
+import jax
+import jax.numpy as jnp
+from flax import linen as nn
+import optax
+from difflogic import LogicLayer, GroupSum
+
+class Model(nn.Module):
+    in_dim: int
+    out_dim: int
+    num_layers: int
+    num_classes: int
+    tau: float
+    grad_factor: float
+    connections: str
+
+    @nn.compact
+    def __call__(self, x, training: bool):
+        llkw = dict(grad_factor=self.grad_factor, connections=self.connections, implementation="python")
+
+        x = x.reshape((x.shape[0], -1)) # Flatten the input
+
+        for _ in range(self.num_layers):
+            x = LogicLayer(in_dim=self.in_dim if _ == 0 else self.out_dim, out_dim=self.out_dim, **llkw)(x, training=training)
+        x = GroupSum(k=self.num_classes, tau=self.tau)(x)
+        return x
+
+
 def get_model(args):
-    llkw = dict(grad_factor=args.grad_factor, connections=args.connections)
+    key = jax.random.PRNGKey(0)
 
     in_dim = input_dim_of_dataset(args.dataset)
     class_count = num_classes_of_dataset(args.dataset)
 
-    logic_layers = []
+    model = Model(in_dim=in_dim, out_dim=args.num_neurons, num_layers=args.num_layers, num_classes=class_count, tau=args.tau, grad_factor=args.grad_factor, connections=args.connections)
 
-    arch = args.architecture
-    k = args.num_neurons
-    l = args.num_layers
+    params = model.init(key, jnp.ones((1, in_dim)), training=True)
 
-    ####################################################################################################################
+    # Placeholder loss function
+    def loss_fn(params, x, y):
+        logits = model.apply(params, x, training=True)
+        return optax.softmax_cross_entropy_with_integer_labels(logits, y).mean()
 
-    if arch == 'randomly_connected':
-        logic_layers.append(torch.nn.Flatten())
-        logic_layers.append(LogicLayer(in_dim=in_dim, out_dim=k, **llkw))
-        for _ in range(l - 1):
-            logic_layers.append(LogicLayer(in_dim=k, out_dim=k, **llkw))
+    optimizer = optax.adam(learning_rate=args.learning_rate)
 
-        model = torch.nn.Sequential(
-            *logic_layers,
-            GroupSum(class_count, args.tau)
-        )
+    return model, params, loss_fn, optimizer
 
-    ####################################################################################################################
-
-    else:
-        raise NotImplementedError(arch)
-
-    ####################################################################################################################
-
-    total_num_neurons = sum(map(lambda x: x.num_neurons, logic_layers[1:-1]))
-    print(f'total_num_neurons={total_num_neurons}')
-    total_num_weights = sum(map(lambda x: x.num_weights, logic_layers[1:-1]))
-    print(f'total_num_weights={total_num_weights}')
-    if args.experiment_id is not None:
-        results.store_results({
-            'total_num_neurons': total_num_neurons,
-            'total_num_weights': total_num_weights,
-        })
-
-    model = model.to('cuda')
-
-    print(model)
-    if args.experiment_id is not None:
-        results.store_results({'model_str': str(model)})
-
-    loss_fn = torch.nn.CrossEntropyLoss()
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
-
-    return model, loss_fn, optimizer
 
 
 def train(model, x, y, loss_fn, optimizer):

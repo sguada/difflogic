@@ -32,6 +32,7 @@ setup(
     cmdclass={'build_ext': BuildExtension},
     python_requires='>=3.6',
     install_requires=[
+        'pallas',
         'torch>=1.6.0',
         'numpy',
     ],

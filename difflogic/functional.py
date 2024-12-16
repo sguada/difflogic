@@ -1,4 +1,4 @@
-import torch
+import jax.numpy as jnp
 import numpy as np
 
 BITS_TO_NP_DTYPE = {8: np.int8, 16: np.int16, 32: np.int32, 64: np.int64}
@@ -29,7 +29,7 @@ def bin_op(a, b, i):
         assert a[1].shape == b[1].shape, (a[1].shape, b[1].shape)
 
     if i == 0:
-        return torch.zeros_like(a)
+        return jnp.zeros_like(a)
     elif i == 1:
         return a * b
     elif i == 2:
@@ -59,11 +59,11 @@ def bin_op(a, b, i):
     elif i == 14:
         return 1 - a * b
     elif i == 15:
-        return torch.ones_like(a)
+        return jnp.ones_like(a)
 
 
 def bin_op_s(a, b, i_s):
-    r = torch.zeros_like(a)
+    r = jnp.zeros_like(a)
     for i in range(16):
         u = bin_op(a, b, i)
         r = r + i_s[..., i] * u
